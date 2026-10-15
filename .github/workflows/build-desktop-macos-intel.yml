@@ -1,0 +1,279 @@
+# Build the DeepSeek Harness Desktop application for macOS 26 on Intel (x64).
+#
+# The upstream repository is cloned from its remote URL during the run, so this
+# repository stores only the workflow and never a copy of the upstream tree.
+#
+# The packaging commands are upstream's own. The target runner is an Intel
+# macOS 26 image, `package:desktop:mac:x64:unsigned` produces an ad-hoc signed
+# DMG without Apple signing or notarization credentials, so the run needs no
+# secrets beyond the workflow token used for the optional release.
+#
+# Standard Intel macOS runners have a 14 GB SSD, which a full Harness desktop
+# build can exhaust, so the workflow reclaims preinstalled toolchains it never
+# uses before installing dependencies.
+name: Build Desktop · macOS 26 Intel (x64)
+
+run-name: macOS x64 desktop from ${{ inputs.source_ref }} · run ${{ github.run_number }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 上游 deepseek-ai/deepseek-harness 的分支或标签（例如 master、dsh-v0.2.1-alpha.4）
+        type: string
+        required: true
+        default: master
+      build_version:
+        description: 构建版本：auto 按日期编号，product 使用上游清单版本，或显式写出受支持的版本
+        type: string
+        required: true
+        default: auto
+      publish_release:
+        description: 构建成功后创建 GitHub Release，并附上 DMG 与 SHA-256 校验文件
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-desktop-macos-intel
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: deepseek-ai/deepseek-harness
+  SOURCE_DIR: source
+  TARGET_DIR: apps/desktop/.desktop-build/targets/mac-x64
+  DSH_TELEMETRY_DISABLED: '1'
+
+jobs:
+  build:
+    name: macOS 26 Intel (x64) unsigned DMG
+    runs-on: macos-26-intel
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Report the build host
+        run: |
+          set -euo pipefail
+          sw_vers
+          echo "architecture: $(uname -m)"
+          echo "developer dir: $(xcode-select -p)"
+          df -h /
+
+      - name: Reclaim disk space
+        run: |
+          set -euo pipefail
+          # Nothing in this build needs the Android SDK, iOS simulator runtimes,
+          # .NET, GHC, or Homebrew's download cache, and each is multiple
+          # gigabytes on the runner image.
+          for path in \
+            /Users/runner/Library/Android \
+            /Users/runner/Library/Developer/CoreSimulator \
+            /Users/runner/Library/Caches/Homebrew \
+            /Users/runner/Library/Caches/pip \
+            /Users/runner/.gradle \
+            /Users/runner/.cargo/registry \
+            /usr/local/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc ; do
+            if [ -e "$path" ]; then
+              echo "removing $path"
+              sudo rm -rf "$path"
+            fi
+          done
+          df -h /
+
+      - name: Reclaim Xcode when the disk is still tight
+        run: |
+          set -euo pipefail
+          # The native addon compiles with `cc` and the installer is signed with
+          # `codesign`/`hdiutil`, all of which the Command Line Tools provide, so
+          # the full Xcode installation is only worth its tens of gigabytes when
+          # the disk can already hold the build.
+          available_kb="$(df -k / | awk 'NR == 2 { print $4 }')"
+          echo "available before: $((available_kb / 1024 / 1024)) GiB"
+          if [ "$available_kb" -ge $((30 * 1024 * 1024)) ]; then
+            echo "keeping Xcode"
+            exit 0
+          fi
+          clt=/Library/Developer/CommandLineTools
+          if [ ! -x "$clt/usr/bin/clang" ]; then
+            echo "Command Line Tools are missing; keeping Xcode and continuing with reduced disk headroom"
+            exit 0
+          fi
+          for bundle in /Applications/Xcode*.app; do
+            if [ -d "$bundle" ]; then
+              echo "removing $bundle"
+              sudo rm -rf "$bundle"
+            fi
+          done
+          # `cc` compiles the native flock addon and `codesign`/`hdiutil` sign and
+          # pack the DMG; every one of them comes from the Command Line Tools.
+          sudo xcode-select --switch "$clt"
+          echo "developer dir: $(xcode-select -p)"
+          cc --version
+          df -h /
+
+      - name: Check out upstream source
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          ref: ${{ inputs.source_ref }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record the upstream revision
+        id: revision
+        working-directory: source
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "product version: $(node -p "require('./apps/desktop/package.json').version")"
+          echo "$UPSTREAM_REPOSITORY@${{ inputs.source_ref }} = $commit"
+
+      - uses: pnpm/action-setup@v5.0.0
+        with:
+          package_json_file: source/package.json
+
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: source/pnpm-lock.yaml
+
+      - name: Install locked dependencies
+        working-directory: source
+        run: pnpm install --frozen-lockfile
+
+      - name: Validate the packaging configuration and toolchain
+        working-directory: source
+        env:
+          PACKAGE_BUILD_VERSION: ${{ inputs.build_version }}
+        run: |
+          set -euo pipefail
+          pnpm run package:desktop:mac:x64:unsigned --check --build-version "$PACKAGE_BUILD_VERSION"
+
+      - name: Build the unsigned macOS x64 DMG
+        working-directory: source
+        env:
+          PACKAGE_BUILD_VERSION: ${{ inputs.build_version }}
+        run: |
+          set -euo pipefail
+          pnpm run package:desktop:mac:x64:unsigned --build-version "$PACKAGE_BUILD_VERSION"
+
+      - name: Verify the built application
+        id: verify
+        working-directory: source
+        run: |
+          set -euo pipefail
+          app="$TARGET_DIR/unsigned-artifacts/mac/DeepSeek Harness.app"
+          binary="$app/Contents/MacOS/DeepSeek Harness"
+          test -f "$binary"
+          architectures="$(lipo -archs "$binary")"
+          echo "architectures: $architectures"
+          file "$binary"
+          echo "LSMinimumSystemVersion: $(/usr/libexec/PlistBuddy -c 'Print LSMinimumSystemVersion' "$app/Contents/Info.plist")"
+          codesign -dv --verbose=2 "$binary" 2>&1 | sed -n '1,20p' || true
+          dmg="$(find "$TARGET_DIR/unsigned-artifacts" -maxdepth 1 -name '*.dmg' -print -quit)"
+          test -n "$dmg"
+          name="$(basename "$dmg")"
+          version="${name#deepseek-harness-}"
+          version="${version%-mac-x64-unsigned.dmg}"
+          digest="$(shasum -a 256 "$dmg" | awk '{print $1}')"
+          {
+            echo "dmg=$dmg"
+            echo "name=$name"
+            echo "version=$version"
+            echo "sha256=$digest"
+            echo "architectures=$architectures"
+          } >> "$GITHUB_OUTPUT"
+          echo "built $name"
+          echo "sha256 $digest"
+
+      - name: Upload the DMG
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: ${{ steps.verify.outputs.name }}
+          path: source/${{ steps.verify.outputs.dmg }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload the packaging diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: packaging-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: source/apps/desktop/.desktop-build/packaging-runs/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Write the release notes and checksum
+        if: ${{ inputs.publish_release }}
+        env:
+          DMG: source/${{ steps.verify.outputs.dmg }}
+        run: |
+          set -euo pipefail
+          name='${{ steps.verify.outputs.name }}'
+          shasum -a 256 "$DMG" > "/tmp/$name.sha256"
+          cat "/tmp/$name.sha256"
+          {
+            printf '%s\n\n' 'DeepSeek Harness Desktop, built for macOS 26 on Intel (x64).'
+            printf '%s\n\n' '| | |' '| --- | --- |'
+            printf '| Upstream source | `%s@%s` |\n' "$UPSTREAM_REPOSITORY" '${{ inputs.source_ref }}'
+            printf '| Upstream commit | `%s` |\n' '${{ steps.revision.outputs.commit }}'
+            printf '| Build version | `%s` |\n' '${{ steps.verify.outputs.version }}'
+            printf '| Artifact | `%s` |\n' "$name"
+            printf '| Architectures | `%s` |\n' '${{ steps.verify.outputs.architectures }}'
+            printf '| SHA-256 | `%s` |\n' '${{ steps.verify.outputs.sha256 }}'
+            printf '%s\n\n' '| Signing | Ad-hoc signed, **not notarized** |'
+            printf '%s\n\n' 'This installer is unsigned, so Gatekeeper blocks the first launch of a downloaded copy. After installing, clear the quarantine attribute:'
+            printf '```sh\n%s\n```\n\n' 'xattr -dr com.apple.quarantine "/Applications/DeepSeek Harness.app"'
+            printf '%s\n' 'The artifact is an x64 build. It runs natively on Intel Macs and under Rosetta 2 on Apple Silicon.'
+          } > /tmp/release-notes.md
+          cat /tmp/release-notes.md
+
+      - name: Publish the GitHub Release
+        if: ${{ inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="desktop-macos-x64-${{ steps.verify.outputs.version }}"
+          assets=("source/${{ steps.verify.outputs.dmg }}" "/tmp/${{ steps.verify.outputs.name }}.sha256")
+          # A prerelease upstream version must not take the repository's "Latest" slot.
+          maturity=()
+          case "${{ steps.verify.outputs.version }}" in
+            *-*) maturity+=(--prerelease) ;;
+          esac
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$tag" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "DeepSeek Harness Desktop · macOS x64 · ${{ steps.verify.outputs.version }}" \
+              --notes-file /tmp/release-notes.md \
+              "${maturity[@]}"
+          fi
+
+      - name: Summarize the run
+        if: always()
+        run: |
+          available_kb="$(df -k / | awk 'NR == 2 { print $4 }')"
+          {
+            echo "## macOS 26 Intel (x64) desktop build"
+            echo
+            echo "- Runner: \`macos-26-intel\`"
+            echo "- Upstream: \`$UPSTREAM_REPOSITORY@${{ inputs.source_ref }}\` = \`${{ steps.revision.outputs.commit }}\`"
+            echo "- Artifact: \`${{ steps.verify.outputs.name }}\`"
+            echo "- Build version: \`${{ steps.verify.outputs.version }}\`"
+            echo "- Architectures: \`${{ steps.verify.outputs.architectures }}\`"
+            echo "- SHA-256: \`${{ steps.verify.outputs.sha256 }}\`"
+            echo "- Signing: ad-hoc signed, not notarized"
+            echo "- Free disk at the end: $((available_kb / 1024 / 1024)) GiB"
+          } >> "$GITHUB_STEP_SUMMARY"
