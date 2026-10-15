@@ -1,0 +1,26 @@
+# TEMPORARY probe: verify how the daily build's expressions resolve on a
+# schedule-triggered run, which cannot be dispatched by hand. Deleted after use.
+name: TEMP schedule probe
+
+on:
+  schedule:
+    - cron: '51 21 * * *'
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    env:
+      SOURCE_REF: ${{ inputs.source_ref || 'master' }}
+      BUILD_VERSION: ${{ inputs.build_version || 'auto' }}
+    steps:
+      - name: Show how each expression resolves
+        run: |
+          echo "event_name           = ${{ github.event_name }}"
+          echo "inputs.source_ref    = [${{ inputs.source_ref }}]"
+          echo "inputs.build_version = [${{ inputs.build_version }}]"
+          echo "inputs.publish_release = [${{ inputs.publish_release }}]"
+          echo "env.SOURCE_REF       = [$SOURCE_REF]"
+          echo "env.BUILD_VERSION    = [$BUILD_VERSION]"
+          echo "release condition    = ${{ github.event_name == 'schedule' || inputs.publish_release }}"
+          echo "inputs json          = ${{ toJson(inputs) }}"
