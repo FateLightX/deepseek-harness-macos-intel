@@ -7,6 +7,16 @@
 
 ## 使用
 
+**自动执行**：每天北京时间 22:00（UTC+8）自动跑一次，用默认参数
+（`master`、`auto` 版本号、创建 Release），产物在 run 的 Artifacts 和 Releases 里。
+
+GitHub 的 cron 用 UTC，所以 `0 14 * * *` 就是 UTC+8 的 22:00。
+定时任务由 GitHub 尽力调度，队列繁忙时可能延后开始；定时触发只在默认分支
+（`main`）生效。另外仓库连续 60 天没有任何提交活动时，GitHub 会自动暂停
+定时任务，届时改动一下仓库或在 Actions 页面重新启用即可。
+
+**手动执行**：
+
 1. 打开 **Actions → Build Desktop · macOS 26 Intel (x64) → Run workflow**。
 2. 填写参数：
 
@@ -16,8 +26,9 @@
    | `build_version` | `auto` 按日期自动编号；`product` 用上游清单版本；也可显式填写受支持的版本 |
    | `publish_release` | 构建成功后创建 GitHub Release，附 DMG 与 SHA-256 |
 
+   定时任务固定创建 Release；手动执行时由 `publish_release` 决定。
 3. 产物在 run 的 **Artifacts** 里（`deepseek-harness-<版本>-mac-x64-unsigned.dmg`），
-   勾选 `publish_release` 时同时出现在 **Releases**。
+   创建了 Release 时同时出现在 **Releases**。
 
 ## 构建内容
 
