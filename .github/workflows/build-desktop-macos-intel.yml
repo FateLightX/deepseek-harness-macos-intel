@@ -14,9 +14,15 @@
 #
 # The workflow runs on a daily schedule in addition to manual dispatch. GitHub
 # cron is always UTC, so 22:00 in UTC+8 is 14:00 UTC.
+#
+# A scheduled run does not build unconditionally: a cheap Linux job resolves the
+# upstream ref to a commit and skips the macOS build when that commit already
+# has a `built-upstream-<sha>` tag here. The tag, not the release, is the record,
+# because tags survive a release being deleted while assets do not survive a
+# deleted release.
 name: Build Desktop · macOS 26 Intel (x64)
 
-run-name: macOS x64 desktop from ${{ inputs.source_ref || 'master' }} · run ${{ github.run_number }}
+run-name: macOS x64 desktop · ${{ inputs.source_ref || 'master' }} · run ${{ github.run_number }}
 
 on:
   schedule:
@@ -40,6 +46,11 @@ on:
         type: boolean
         required: true
         default: true
+      force:
+        description: 即使这个上游 commit 已经构建过，也重新构建一次
+        type: boolean
+        required: true
+        default: false
 
 permissions:
   contents: write
@@ -55,8 +66,65 @@ env:
   DSH_TELEMETRY_DISABLED: '1'
 
 jobs:
+  check:
+    name: Check upstream for new commits
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      build: ${{ steps.compare.outputs.build }}
+      commit: ${{ steps.compare.outputs.commit }}
+      short_commit: ${{ steps.compare.outputs.short_commit }}
+    env:
+      # A scheduled run carries no dispatch inputs; these are its defaults.
+      SOURCE_REF: ${{ inputs.source_ref || 'master' }}
+      FORCE: ${{ inputs.force || false }}
+    steps:
+      - name: Compare the upstream ref with the last recorded build
+        id: compare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          encoded="$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1], safe=""))' "$SOURCE_REF")"
+          # Resolve the ref once and build that exact commit, so a branch moving
+          # between this check and the checkout cannot build something unseen.
+          commit="$(gh api "repos/$UPSTREAM_REPOSITORY/commits/$encoded" --jq .sha)"
+          short="$(printf '%s' "$commit" | cut -c1-12)"
+          marker="built-upstream-$commit"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "short_commit=$short" >> "$GITHUB_OUTPUT"
+
+          reason=""
+          build=true
+          if [ "$FORCE" = "true" ]; then
+            reason="forced rebuild"
+          elif gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$marker" >/dev/null 2>&1; then
+            build=false
+            reason="this commit was already built"
+          else
+            reason="new upstream commit"
+          fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Upstream check"
+            echo
+            echo "- Ref: \`$UPSTREAM_REPOSITORY@$SOURCE_REF\`"
+            echo "- Commit: \`$short\`"
+            echo "- Already built: $([ "$build" = true ] && echo no || echo yes) (marker \`$marker\`)"
+            echo "- Decision: $([ "$build" = true ] && echo build || echo skip) — $reason"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$build" = true ]; then
+            echo "::notice::$UPSTREAM_REPOSITORY@$SOURCE_REF is $short; building ($reason)"
+          else
+            echo "::notice::skipping the build: $UPSTREAM_REPOSITORY@$SOURCE_REF is still $short ($reason)"
+          fi
+
   build:
     name: macOS 26 Intel (x64) unsigned DMG
+    needs: check
+    if: needs.check.outputs.build == 'true'
     runs-on: macos-26-intel
     timeout-minutes: 240
     defaults:
@@ -136,7 +204,7 @@ jobs:
         uses: actions/checkout@v7.0.1
         with:
           repository: ${{ env.UPSTREAM_REPOSITORY }}
-          ref: ${{ env.SOURCE_REF }}
+          ref: ${{ needs.check.outputs.commit }}
           path: source
           fetch-depth: 1
           persist-credentials: false
@@ -218,6 +286,26 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - name: Record the built upstream commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="built-upstream-${{ needs.check.outputs.commit }}"
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" >/dev/null 2>&1; then
+            echo "marker $tag already exists"
+            exit 0
+          fi
+          # The marker points at this repository's own commit: the tagged object
+          # must exist locally, and only the tag name carries the upstream sha.
+          if ! gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="refs/tags/$tag" -f sha="$GITHUB_SHA" >/dev/null 2>&1; then
+            # A concurrent run may have created it between the check and here.
+            gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" >/dev/null 2>&1 \
+              || { echo "::error::could not record $tag"; exit 1; }
+          fi
+          echo "recorded $tag"
+
       - name: Upload the packaging diagnostics
         if: always()
         uses: actions/upload-artifact@v7.0.1
@@ -285,6 +373,7 @@ jobs:
             echo "- Trigger: \`${{ github.event_name }}\`"
             echo "- Runner: \`macos-26-intel\`"
             echo "- Upstream: \`$UPSTREAM_REPOSITORY@$SOURCE_REF\` = \`${{ steps.revision.outputs.commit }}\`"
+            echo "- Commit check: new commit, built (marker \`built-upstream-${{ needs.check.outputs.commit }}\`)"
             echo "- Artifact: \`${{ steps.verify.outputs.name }}\`"
             echo "- Build version: \`${{ steps.verify.outputs.version }}\`"
             echo "- Architectures: \`${{ steps.verify.outputs.architectures }}\`"

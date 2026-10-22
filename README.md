@@ -7,8 +7,15 @@
 
 ## 使用
 
-**自动执行**：每天北京时间 22:00（UTC+8）自动跑一次，用默认参数
-（`master`、`auto` 版本号、创建 Release），产物在 run 的 Artifacts 和 Releases 里。
+**自动执行**：每天北京时间 22:00（UTC+8）检查一次上游 `master`。
+
+只有上游有新 commit 时才真正编译；上游没变就只跑一个约 20 秒的 Linux 检查
+job，macOS 构建 job 直接跳过，不会产出重复安装包。
+
+判断依据是仓库里的 `built-upstream-<完整 commit SHA>` tag：构建成功后写一个，
+下次检查发现该 tag 已存在就跳过。用 tag 而不是 Release 记录，是因为 tag 比
+Release 更耐久——删掉 Release 不会让状态丢失。想强制重建同一个 commit，
+手动执行时把 `force` 打开。
 
 GitHub 的 cron 用 UTC，所以 `0 14 * * *` 就是 UTC+8 的 22:00。
 定时任务由 GitHub 尽力调度，队列繁忙时可能延后开始；定时触发只在默认分支
@@ -25,12 +32,17 @@ GitHub 的 cron 用 UTC，所以 `0 14 * * *` 就是 UTC+8 的 22:00。
    | `source_ref` | 上游分支或标签，例如 `master`、`dsh-v0.2.1-alpha.4` |
    | `build_version` | `auto` 按日期自动编号；`product` 用上游清单版本；也可显式填写受支持的版本 |
    | `publish_release` | 构建成功后创建 GitHub Release，附 DMG 与 SHA-256 |
+   | `force` | 该上游 commit 已构建过也强制重建 |
 
    定时任务固定创建 Release；手动执行时由 `publish_release` 决定。
 3. 产物在 run 的 **Artifacts** 里（`deepseek-harness-<版本>-mac-x64-unsigned.dmg`），
    创建了 Release 时同时出现在 **Releases**。
 
 ## 构建内容
+
+流程分两个 job：`check`（ubuntu，约 20 秒）解析上游 ref 到具体 commit 并判断
+是否需要构建；`build`（`macos-26-intel`）只在需要时运行，并检出 `check`
+解析出的那个 commit，避免检查与构建之间分支移动导致构建了没检查过的代码。
 
 - Runner：`macos-26-intel`（标准托管 runner，Intel x64，macOS 26）。
 - 命令：上游自带的 `pnpm run package:desktop:mac:x64:unsigned`，即上游的
