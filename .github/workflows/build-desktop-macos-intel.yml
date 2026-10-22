@@ -3,21 +3,21 @@
 # The upstream tree is cloned from its remote URL during the run, so this
 # repository stores only the workflow and never a copy of the source.
 #
-# Building only when upstream changed needs one fact: which upstream commit the
-# published installer was built from. Instead of keeping that fact in a marker
-# tag, a state file, or a repository variable, the release tag carries it:
+# A build happens only when upstream publishes a new release. The newest
+# `dsh-v*` release tag names the source to build and the version to publish:
+# `dsh-v0.2.1-rc.2` produces `desktop-macos-x64-0.2.1-rc.2`. That release tag is
+# also the record of what has been built, so "already built" simply means the
+# release exists and deleting it asks for a rebuild. No marker tags, no state
+# files, no version input.
 #
-#     desktop-macos-x64-<upstream commit, 12 hex>
+# Release stage (rc/dev/alpha) is irrelevant here: whatever upstream publishes
+# most recently is built.
 #
-# So "already built" simply means that release exists, and deleting a release
-# is the supported way to ask for that commit to be rebuilt. No bookkeeping job,
-# no extra writes, and no way for the record to drift from the artifacts.
-#
-# The gate runs on Linux so an unchanged upstream costs twenty seconds instead
-# of a macOS runner. GitHub cron is UTC, so 22:00 in UTC+8 is 14:00 UTC.
+# The check runs on Linux so an unchanged upstream costs seconds instead of a
+# macOS runner. GitHub cron is UTC, so 22:00 in UTC+8 is 14:00 UTC.
 name: Build Desktop · macOS 26 Intel (x64)
 
-run-name: macOS x64 desktop · ${{ inputs.source_ref || 'master' }} · run ${{ github.run_number }}
+run-name: macOS x64 desktop · ${{ inputs.release_tag || 'latest release' }} · run ${{ github.run_number }}
 
 on:
   schedule:
@@ -26,16 +26,11 @@ on:
     - cron: '0 14 * * *'
   workflow_dispatch:
     inputs:
-      source_ref:
-        description: 上游 deepseek-ai/deepseek-harness 的分支或标签（例如 master、dsh-v0.2.1-rc.2）
+      release_tag:
+        description: 上游 release tag（如 dsh-v0.2.1-rc.1）；留空则取最新 release
         type: string
-        required: true
-        default: master
-      build_version:
-        description: 构建版本：auto 按日期编号，product 使用上游清单版本，或显式写出受支持的版本
-        type: string
-        required: true
-        default: auto
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -46,59 +41,74 @@ concurrency:
 
 env:
   UPSTREAM: deepseek-ai/deepseek-harness
-  # Release tags are the build record; never rename this without also migrating
-  # the existing releases, or every commit looks unbuilt.
-  RELEASE_PREFIX: desktop-macos-x64
+  # Release tags double as the build record; renaming this without migrating the
+  # existing releases would make every published version look unbuilt.
+  PREFIX: desktop-macos-x64
   DSH_TELEMETRY_DISABLED: '1'
 
 jobs:
   check:
-    name: Has upstream changed?
+    name: Has upstream published a new release?
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     outputs:
       build: ${{ steps.gate.outputs.build }}
-      commit: ${{ steps.gate.outputs.commit }}
+      upstream_tag: ${{ steps.gate.outputs.upstream_tag }}
+      version: ${{ steps.gate.outputs.version }}
       release_tag: ${{ steps.gate.outputs.release_tag }}
     env:
-      # A scheduled run carries no dispatch inputs; this is its default.
-      SOURCE_REF: ${{ inputs.source_ref || 'master' }}
+      GH_TOKEN: ${{ github.token }}
+      REQUESTED: ${{ inputs.release_tag }}
     steps:
-      - name: Resolve the upstream commit and look for its release
+      - name: Compare the newest upstream release with this repository
         id: gate
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          encoded="$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1], safe=""))' "$SOURCE_REF")"
-          commit="$(gh api "repos/$UPSTREAM/commits/$encoded" --jq .sha)"
-          tag="$RELEASE_PREFIX-${commit:0:12}"
 
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          if [ -n "${REQUESTED// /}" ]; then
+            tag="$REQUESTED"
+            source="requested"
+          else
+            # Newest published `dsh-v*` release. Drafts are excluded, and the
+            # release stage is deliberately not filtered.
+            tag="$(gh release list --repo "$UPSTREAM" --exclude-drafts --limit 50 --json tagName \
+              --jq '[.[] | select(.tagName | startswith("dsh-v"))][0].tagName')"
+            source="newest upstream release"
+          fi
+          test -n "$tag" && test "$tag" != "null" || { echo "::error::no dsh-v* release found upstream"; exit 1; }
+
+          gh release view "$tag" --repo "$UPSTREAM" >/dev/null
+          version="${tag#dsh-v}"
+          release_tag="$PREFIX-$version"
+
+          if gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             build=false
-            note="\`$tag\` already publishes this commit"
+            note="\`$release_tag\` already exists"
           else
             build=true
-            note="no \`$tag\` release yet"
+            note="\`$release_tag\` does not exist yet"
           fi
 
-          echo "commit=$commit" >> "$GITHUB_OUTPUT"
-          echo "release_tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "build=$build" >> "$GITHUB_OUTPUT"
+          {
+            echo "upstream_tag=$tag" >> "$GITHUB_OUTPUT"
+            echo "version=$version" >> "$GITHUB_OUTPUT"
+            echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+            echo "build=$build" >> "$GITHUB_OUTPUT"
+          }
 
           {
-            echo "## Upstream check"
+            echo "## Upstream release check"
             echo
             echo "| | |"
             echo "| --- | --- |"
-            echo "| Upstream | \`$UPSTREAM@$SOURCE_REF\` |"
-            echo "| Commit | \`$commit\` |"
-            echo "| Release tag | \`$tag\` |"
+            echo "| Upstream release | \`$UPSTREAM@$tag\` ($source) |"
+            echo "| Desktop version | \`$version\` |"
+            echo "| This repository | \`$release_tag\` |"
             echo "| Decision | **$([ "$build" = true ] && echo build || echo skip)** — $note |"
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "$build" = true ]; then
-            echo "::notice::building $commit ($note)"
+            echo "::notice::building $tag ($note)"
           else
             echo "::notice::skipping the build ($note)"
           fi
@@ -113,7 +123,6 @@ jobs:
       run:
         shell: bash
     env:
-      BUILD_VERSION: ${{ inputs.build_version || 'auto' }}
       TARGET_DIR: apps/desktop/.desktop-build/targets/mac-x64
     steps:
       - name: Report the build host
@@ -177,22 +186,26 @@ jobs:
           cc --version
           df -h /
 
-      - name: Check out the upstream commit the gate resolved
+      - name: Check out the upstream release tag
         uses: actions/checkout@v7.0.1
         with:
           repository: ${{ env.UPSTREAM }}
-          ref: ${{ needs.check.outputs.commit }}
+          ref: ${{ needs.check.outputs.upstream_tag }}
           path: source
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Confirm the checkout is the commit that was checked
+      - name: Confirm the checkout is that release
         run: |
           set -euo pipefail
-          # Building anything else would publish an installer for a commit the
-          # gate never inspected.
-          test "$(git -C source rev-parse HEAD)" = "${{ needs.check.outputs.commit }}"
-          echo "building $UPSTREAM@${{ needs.check.outputs.commit }}"
+          # The tag is immutable, so this only guards a bad ref: publishing a
+          # different version than the release tag promised would be silent.
+          declared="$(node -p "require('./source/apps/desktop/package.json').version")"
+          test "$declared" = "${{ needs.check.outputs.version }}" || {
+            echo "::error::checked out ${{ needs.check.outputs.upstream_tag }} declares $declared, expected ${{ needs.check.outputs.version }}"
+            exit 1
+          }
+          echo "building ${{ needs.check.outputs.upstream_tag }} (version $declared)"
 
       - uses: pnpm/action-setup@v5.0.0
         with:
@@ -210,19 +223,11 @@ jobs:
 
       - name: Validate the packaging configuration and toolchain
         working-directory: source
-        env:
-          PACKAGE_BUILD_VERSION: ${{ env.BUILD_VERSION }}
-        run: |
-          set -euo pipefail
-          pnpm run package:desktop:mac:x64:unsigned --check --build-version "$PACKAGE_BUILD_VERSION"
+        run: pnpm run package:desktop:mac:x64:unsigned --check
 
       - name: Build the unsigned macOS x64 DMG
         working-directory: source
-        env:
-          PACKAGE_BUILD_VERSION: ${{ env.BUILD_VERSION }}
-        run: |
-          set -euo pipefail
-          pnpm run package:desktop:mac:x64:unsigned --build-version "$PACKAGE_BUILD_VERSION"
+        run: pnpm run package:desktop:mac:x64:unsigned
 
       - name: Verify the built application
         id: verify
@@ -243,12 +248,15 @@ jobs:
           dmg="$(find "$TARGET_DIR/unsigned-artifacts" -maxdepth 1 -name '*.dmg' -print -quit)"
           test -n "$dmg"
           name="$(basename "$dmg")"
-          version="${name#deepseek-harness-}"
-          version="${version%-mac-x64-unsigned.dmg}"
+          # The artifact name carries the version electron-builder wrote, which
+          # must be the release version rather than the manifest default.
+          case "$name" in
+            *"${{ needs.check.outputs.version }}"*) ;;
+            *) echo "::error::$name does not carry version ${{ needs.check.outputs.version }}"; exit 1 ;;
+          esac
           {
             echo "dmg=$dmg"
             echo "name=$name"
-            echo "version=$version"
             echo "architectures=$architectures"
             echo "sha256=$(shasum -a 256 "$dmg" | awk '{print $1}')"
           } >> "$GITHUB_OUTPUT"
@@ -260,7 +268,7 @@ jobs:
           name: ${{ steps.verify.outputs.name }}
           path: source/${{ steps.verify.outputs.dmg }}
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
 
       - name: Upload the packaging diagnostics
         if: always()
@@ -275,7 +283,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.check.outputs.release_tag }}
-          COMMIT: ${{ needs.check.outputs.commit }}
+          UPSTREAM_TAG: ${{ needs.check.outputs.upstream_tag }}
+          VERSION: ${{ needs.check.outputs.version }}
         run: |
           set -euo pipefail
           dmg="source/${{ steps.verify.outputs.dmg }}"
@@ -286,32 +295,27 @@ jobs:
           {
             printf '%s\n\n' 'DeepSeek Harness Desktop, built for macOS 26 on Intel (x64).'
             printf '%s\n\n' '| | |' '| --- | --- |'
-            printf '| Upstream | `%s` |\n' "$UPSTREAM"
-            printf '| Upstream commit | `%s` |\n' "$COMMIT"
-            printf '| Build version | `%s` |\n' '${{ steps.verify.outputs.version }}'
+            printf '| Upstream release | `%s@%s` |\n' "$UPSTREAM" "$UPSTREAM_TAG"
+            printf '| Version | `%s` |\n' "$VERSION"
             printf '| Artifact | `%s` |\n' "$name"
             printf '| Architectures | `%s` |\n' '${{ steps.verify.outputs.architectures }}'
             printf '| SHA-256 | `%s` |\n' '${{ steps.verify.outputs.sha256 }}'
             printf '%s\n\n' '| Signing | Ad-hoc signed, **not notarized** |'
             printf '%s\n\n' 'This installer is unsigned, so Gatekeeper blocks the first launch of a downloaded copy. After installing, clear the quarantine attribute:'
             printf '```sh\n%s\n```\n\n' 'xattr -dr com.apple.quarantine "/Applications/DeepSeek Harness.app"'
-            printf '%s\n\n' 'The tag names the upstream commit this release was built from. Deleting the release is how you ask for that commit to be rebuilt.'
+            printf '%s\n\n' 'The tag names the upstream release this was built from. Deleting this release is how you ask for that version to be rebuilt.'
             printf '%s\n' 'The artifact is an x64 build: native on Intel Macs, Rosetta 2 on Apple Silicon.'
           } > /tmp/release-notes.md
           cat /tmp/release-notes.md
 
-          # A prerelease upstream version must not take the repository's "Latest" slot.
-          maturity=()
-          case '${{ steps.verify.outputs.version }}' in
-            *-*) maturity+=(--prerelease) ;;
-          esac
-
+          # Upstream publishes prereleases only, so this must never take the
+          # repository's "Latest" slot.
           gh release create "$TAG" "$dmg" "/tmp/$name.sha256" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
-            --title "DeepSeek Harness Desktop · macOS x64 · ${{ steps.verify.outputs.version }}" \
+            --title "DeepSeek Harness Desktop · macOS x64 · $VERSION" \
             --notes-file /tmp/release-notes.md \
-            "${maturity[@]}"
+            --prerelease
 
       - name: Summarize the run
         if: always()
@@ -324,9 +328,9 @@ jobs:
             echo "| --- | --- |"
             echo "| Trigger | \`${{ github.event_name }}\` |"
             echo "| Runner | \`macos-26-intel\` |"
-            echo "| Upstream | \`$UPSTREAM@${{ needs.check.outputs.commit }}\` |"
+            echo "| Upstream release | \`$UPSTREAM@${{ needs.check.outputs.upstream_tag }}\` |"
+            echo "| Version | \`${{ needs.check.outputs.version }}\` |"
             echo "| Artifact | \`${{ steps.verify.outputs.name }}\` |"
-            echo "| Build version | \`${{ steps.verify.outputs.version }}\` |"
             echo "| Architectures | \`${{ steps.verify.outputs.architectures }}\` |"
             echo "| SHA-256 | \`${{ steps.verify.outputs.sha256 }}\` |"
             echo "| Signing | ad-hoc signed, not notarized |"
