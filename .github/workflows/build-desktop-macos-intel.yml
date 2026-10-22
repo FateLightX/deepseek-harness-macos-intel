@@ -1,38 +1,33 @@
 # Build the DeepSeek Harness Desktop application for macOS 26 on Intel (x64).
 #
-# The upstream repository is cloned from its remote URL during the run, so this
-# repository stores only the workflow and never a copy of the upstream tree.
+# The upstream tree is cloned from its remote URL during the run, so this
+# repository stores only the workflow and never a copy of the source.
 #
-# The packaging commands are upstream's own. The target runner is an Intel
-# macOS 26 image, `package:desktop:mac:x64:unsigned` produces an ad-hoc signed
-# DMG without Apple signing or notarization credentials, so the run needs no
-# secrets beyond the workflow token used for the optional release.
+# Building only when upstream changed needs one fact: which upstream commit the
+# published installer was built from. Instead of keeping that fact in a marker
+# tag, a state file, or a repository variable, the release tag carries it:
 #
-# Standard Intel macOS runners have a 14 GB SSD, which a full Harness desktop
-# build can exhaust, so the workflow reclaims preinstalled toolchains it never
-# uses before installing dependencies.
+#     desktop-macos-x64-<upstream commit, 12 hex>
 #
-# The workflow runs on a daily schedule in addition to manual dispatch. GitHub
-# cron is always UTC, so 22:00 in UTC+8 is 14:00 UTC.
+# So "already built" simply means that release exists, and deleting a release
+# is the supported way to ask for that commit to be rebuilt. No bookkeeping job,
+# no extra writes, and no way for the record to drift from the artifacts.
 #
-# A scheduled run does not build unconditionally: a cheap Linux job resolves the
-# upstream ref to a commit and skips the macOS build when that commit already
-# has a `built-upstream-<sha>` tag here. The tag, not the release, is the record,
-# because tags survive a release being deleted while assets do not survive a
-# deleted release.
+# The gate runs on Linux so an unchanged upstream costs twenty seconds instead
+# of a macOS runner. GitHub cron is UTC, so 22:00 in UTC+8 is 14:00 UTC.
 name: Build Desktop · macOS 26 Intel (x64)
 
 run-name: macOS x64 desktop · ${{ inputs.source_ref || 'master' }} · run ${{ github.run_number }}
 
 on:
   schedule:
-    # 22:00 Asia/Shanghai (UTC+8). GitHub cron is UTC, and scheduled runs are
-    # best-effort: a heavily loaded queue can delay the start.
+    # 22:00 Asia/Shanghai (UTC+8). GitHub cron is UTC, and scheduled starts are
+    # best-effort: a busy queue can delay them.
     - cron: '0 14 * * *'
   workflow_dispatch:
     inputs:
       source_ref:
-        description: 上游 deepseek-ai/deepseek-harness 的分支或标签（例如 master、dsh-v0.2.1-alpha.4）
+        description: 上游 deepseek-ai/deepseek-harness 的分支或标签（例如 master、dsh-v0.2.1-rc.2）
         type: string
         required: true
         default: master
@@ -41,16 +36,6 @@ on:
         type: string
         required: true
         default: auto
-      publish_release:
-        description: 构建成功后创建 GitHub Release，并附上 DMG 与 SHA-256 校验文件
-        type: boolean
-        required: true
-        default: true
-      force:
-        description: 即使这个上游 commit 已经构建过，也重新构建一次
-        type: boolean
-        required: true
-        default: false
 
 permissions:
   contents: write
@@ -60,65 +45,62 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  UPSTREAM_REPOSITORY: deepseek-ai/deepseek-harness
-  SOURCE_DIR: source
-  TARGET_DIR: apps/desktop/.desktop-build/targets/mac-x64
+  UPSTREAM: deepseek-ai/deepseek-harness
+  # Release tags are the build record; never rename this without also migrating
+  # the existing releases, or every commit looks unbuilt.
+  RELEASE_PREFIX: desktop-macos-x64
   DSH_TELEMETRY_DISABLED: '1'
 
 jobs:
   check:
-    name: Check upstream for new commits
+    name: Has upstream changed?
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
-      build: ${{ steps.compare.outputs.build }}
-      commit: ${{ steps.compare.outputs.commit }}
-      short_commit: ${{ steps.compare.outputs.short_commit }}
+      build: ${{ steps.gate.outputs.build }}
+      commit: ${{ steps.gate.outputs.commit }}
+      release_tag: ${{ steps.gate.outputs.release_tag }}
     env:
-      # A scheduled run carries no dispatch inputs; these are its defaults.
+      # A scheduled run carries no dispatch inputs; this is its default.
       SOURCE_REF: ${{ inputs.source_ref || 'master' }}
-      FORCE: ${{ inputs.force || false }}
     steps:
-      - name: Compare the upstream ref with the last recorded build
-        id: compare
+      - name: Resolve the upstream commit and look for its release
+        id: gate
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           encoded="$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1], safe=""))' "$SOURCE_REF")"
-          # Resolve the ref once and build that exact commit, so a branch moving
-          # between this check and the checkout cannot build something unseen.
-          commit="$(gh api "repos/$UPSTREAM_REPOSITORY/commits/$encoded" --jq .sha)"
-          short="$(printf '%s' "$commit" | cut -c1-12)"
-          marker="built-upstream-$commit"
-          echo "commit=$commit" >> "$GITHUB_OUTPUT"
-          echo "short_commit=$short" >> "$GITHUB_OUTPUT"
+          commit="$(gh api "repos/$UPSTREAM/commits/$encoded" --jq .sha)"
+          tag="$RELEASE_PREFIX-${commit:0:12}"
 
-          reason=""
-          build=true
-          if [ "$FORCE" = "true" ]; then
-            reason="forced rebuild"
-          elif gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$marker" >/dev/null 2>&1; then
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             build=false
-            reason="this commit was already built"
+            note="\`$tag\` already publishes this commit"
           else
-            reason="new upstream commit"
+            build=true
+            note="no \`$tag\` release yet"
           fi
+
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$tag" >> "$GITHUB_OUTPUT"
           echo "build=$build" >> "$GITHUB_OUTPUT"
 
           {
             echo "## Upstream check"
             echo
-            echo "- Ref: \`$UPSTREAM_REPOSITORY@$SOURCE_REF\`"
-            echo "- Commit: \`$short\`"
-            echo "- Already built: $([ "$build" = true ] && echo no || echo yes) (marker \`$marker\`)"
-            echo "- Decision: $([ "$build" = true ] && echo build || echo skip) — $reason"
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Upstream | \`$UPSTREAM@$SOURCE_REF\` |"
+            echo "| Commit | \`$commit\` |"
+            echo "| Release tag | \`$tag\` |"
+            echo "| Decision | **$([ "$build" = true ] && echo build || echo skip)** — $note |"
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "$build" = true ]; then
-            echo "::notice::$UPSTREAM_REPOSITORY@$SOURCE_REF is $short; building ($reason)"
+            echo "::notice::building $commit ($note)"
           else
-            echo "::notice::skipping the build: $UPSTREAM_REPOSITORY@$SOURCE_REF is still $short ($reason)"
+            echo "::notice::skipping the build ($note)"
           fi
 
   build:
@@ -131,12 +113,8 @@ jobs:
       run:
         shell: bash
     env:
-      # A scheduled run carries no dispatch inputs, so the string inputs are
-      # resolved once here; the defaults are what a plain daily run builds.
-      # `PUBLISH_RELEASE` stays out of `env` because an `if:` condition reading a
-      # string "false" would treat it as true.
-      SOURCE_REF: ${{ inputs.source_ref || 'master' }}
       BUILD_VERSION: ${{ inputs.build_version || 'auto' }}
+      TARGET_DIR: apps/desktop/.desktop-build/targets/mac-x64
     steps:
       - name: Report the build host
         run: |
@@ -149,9 +127,11 @@ jobs:
       - name: Reclaim disk space
         run: |
           set -euo pipefail
-          # Nothing in this build needs the Android SDK, iOS simulator runtimes,
-          # .NET, GHC, or Homebrew's download cache, and each is multiple
-          # gigabytes on the runner image.
+          # Nothing here needs the Android SDK, iOS simulator runtimes, .NET,
+          # GHC, or Homebrew's download cache, and each is gigabytes. A full
+          # desktop build holds the pnpm store, an Electron distribution, a
+          # Python/Node primary runtime, and two electron-builder trees at once,
+          # while a standard Intel macOS runner has a 14 GB SSD.
           for path in \
             /Users/runner/Library/Android \
             /Users/runner/Library/Developer/CoreSimulator \
@@ -172,10 +152,9 @@ jobs:
       - name: Reclaim Xcode when the disk is still tight
         run: |
           set -euo pipefail
-          # The native addon compiles with `cc` and the installer is signed with
-          # `codesign`/`hdiutil`, all of which the Command Line Tools provide, so
-          # the full Xcode installation is only worth its tens of gigabytes when
-          # the disk can already hold the build.
+          # `cc` compiles the native flock addon and `codesign`/`hdiutil` sign
+          # and pack the DMG; the Command Line Tools provide all of them, so the
+          # full Xcode installation is only kept while the disk allows it.
           available_kb="$(df -k / | awk 'NR == 2 { print $4 }')"
           echo "available before: $((available_kb / 1024 / 1024)) GiB"
           if [ "$available_kb" -ge $((30 * 1024 * 1024)) ]; then
@@ -193,31 +172,27 @@ jobs:
               sudo rm -rf "$bundle"
             fi
           done
-          # `cc` compiles the native flock addon and `codesign`/`hdiutil` sign and
-          # pack the DMG; every one of them comes from the Command Line Tools.
           sudo xcode-select --switch "$clt"
           echo "developer dir: $(xcode-select -p)"
           cc --version
           df -h /
 
-      - name: Check out upstream source
+      - name: Check out the upstream commit the gate resolved
         uses: actions/checkout@v7.0.1
         with:
-          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          repository: ${{ env.UPSTREAM }}
           ref: ${{ needs.check.outputs.commit }}
           path: source
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Record the upstream revision
-        id: revision
-        working-directory: source
+      - name: Confirm the checkout is the commit that was checked
         run: |
           set -euo pipefail
-          commit="$(git rev-parse HEAD)"
-          echo "commit=$commit" >> "$GITHUB_OUTPUT"
-          echo "product version: $(node -p "require('./apps/desktop/package.json').version")"
-          echo "$UPSTREAM_REPOSITORY@$SOURCE_REF = $commit"
+          # Building anything else would publish an installer for a commit the
+          # gate never inspected.
+          test "$(git -C source rev-parse HEAD)" = "${{ needs.check.outputs.commit }}"
+          echo "building $UPSTREAM@${{ needs.check.outputs.commit }}"
 
       - uses: pnpm/action-setup@v5.0.0
         with:
@@ -258,25 +233,26 @@ jobs:
           binary="$app/Contents/MacOS/DeepSeek Harness"
           test -f "$binary"
           architectures="$(lipo -archs "$binary")"
-          echo "architectures: $architectures"
+          case "$architectures" in
+            *x86_64*) ;;
+            *) echo "::error::expected an x86_64 build, got $architectures"; exit 1 ;;
+          esac
           file "$binary"
           echo "LSMinimumSystemVersion: $(/usr/libexec/PlistBuddy -c 'Print LSMinimumSystemVersion' "$app/Contents/Info.plist")"
-          codesign -dv --verbose=2 "$binary" 2>&1 | sed -n '1,20p' || true
+          codesign --verify --deep --verbose=2 "$app"
           dmg="$(find "$TARGET_DIR/unsigned-artifacts" -maxdepth 1 -name '*.dmg' -print -quit)"
           test -n "$dmg"
           name="$(basename "$dmg")"
           version="${name#deepseek-harness-}"
           version="${version%-mac-x64-unsigned.dmg}"
-          digest="$(shasum -a 256 "$dmg" | awk '{print $1}')"
           {
             echo "dmg=$dmg"
             echo "name=$name"
             echo "version=$version"
-            echo "sha256=$digest"
             echo "architectures=$architectures"
+            echo "sha256=$(shasum -a 256 "$dmg" | awk '{print $1}')"
           } >> "$GITHUB_OUTPUT"
           echo "built $name"
-          echo "sha256 $digest"
 
       - name: Upload the DMG
         uses: actions/upload-artifact@v7.0.1
@@ -285,26 +261,6 @@ jobs:
           path: source/${{ steps.verify.outputs.dmg }}
           if-no-files-found: error
           retention-days: 14
-
-      - name: Record the built upstream commit
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          tag="built-upstream-${{ needs.check.outputs.commit }}"
-          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" >/dev/null 2>&1; then
-            echo "marker $tag already exists"
-            exit 0
-          fi
-          # The marker points at this repository's own commit: the tagged object
-          # must exist locally, and only the tag name carries the upstream sha.
-          if ! gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
-            -f ref="refs/tags/$tag" -f sha="$GITHUB_SHA" >/dev/null 2>&1; then
-            # A concurrent run may have created it between the check and here.
-            gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" >/dev/null 2>&1 \
-              || { echo "::error::could not record $tag"; exit 1; }
-          fi
-          echo "recorded $tag"
 
       - name: Upload the packaging diagnostics
         if: always()
@@ -315,20 +271,23 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      - name: Write the release notes and checksum
-        if: ${{ github.event_name == 'schedule' || inputs.publish_release }}
+      - name: Publish the release that records this build
         env:
-          DMG: source/${{ steps.verify.outputs.dmg }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.release_tag }}
+          COMMIT: ${{ needs.check.outputs.commit }}
         run: |
           set -euo pipefail
-          name='${{ steps.verify.outputs.name }}'
-          shasum -a 256 "$DMG" > "/tmp/$name.sha256"
+          dmg="source/${{ steps.verify.outputs.dmg }}"
+          name="$(basename "$dmg")"
+          shasum -a 256 "$dmg" > "/tmp/$name.sha256"
           cat "/tmp/$name.sha256"
+
           {
             printf '%s\n\n' 'DeepSeek Harness Desktop, built for macOS 26 on Intel (x64).'
             printf '%s\n\n' '| | |' '| --- | --- |'
-            printf '| Upstream source | `%s@%s` |\n' "$UPSTREAM_REPOSITORY" "$SOURCE_REF"
-            printf '| Upstream commit | `%s` |\n' '${{ steps.revision.outputs.commit }}'
+            printf '| Upstream | `%s` |\n' "$UPSTREAM"
+            printf '| Upstream commit | `%s` |\n' "$COMMIT"
             printf '| Build version | `%s` |\n' '${{ steps.verify.outputs.version }}'
             printf '| Artifact | `%s` |\n' "$name"
             printf '| Architectures | `%s` |\n' '${{ steps.verify.outputs.architectures }}'
@@ -336,32 +295,23 @@ jobs:
             printf '%s\n\n' '| Signing | Ad-hoc signed, **not notarized** |'
             printf '%s\n\n' 'This installer is unsigned, so Gatekeeper blocks the first launch of a downloaded copy. After installing, clear the quarantine attribute:'
             printf '```sh\n%s\n```\n\n' 'xattr -dr com.apple.quarantine "/Applications/DeepSeek Harness.app"'
-            printf '%s\n' 'The artifact is an x64 build. It runs natively on Intel Macs and under Rosetta 2 on Apple Silicon.'
+            printf '%s\n\n' 'The tag names the upstream commit this release was built from. Deleting the release is how you ask for that commit to be rebuilt.'
+            printf '%s\n' 'The artifact is an x64 build: native on Intel Macs, Rosetta 2 on Apple Silicon.'
           } > /tmp/release-notes.md
           cat /tmp/release-notes.md
 
-      - name: Publish the GitHub Release
-        if: ${{ github.event_name == 'schedule' || inputs.publish_release }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          tag="desktop-macos-x64-${{ steps.verify.outputs.version }}"
-          assets=("source/${{ steps.verify.outputs.dmg }}" "/tmp/${{ steps.verify.outputs.name }}.sha256")
           # A prerelease upstream version must not take the repository's "Latest" slot.
           maturity=()
-          case "${{ steps.verify.outputs.version }}" in
+          case '${{ steps.verify.outputs.version }}' in
             *-*) maturity+=(--prerelease) ;;
           esac
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$tag" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
-          else
-            gh release create "$tag" "${assets[@]}" \
-              --repo "$GITHUB_REPOSITORY" \
-              --title "DeepSeek Harness Desktop · macOS x64 · ${{ steps.verify.outputs.version }}" \
-              --notes-file /tmp/release-notes.md \
-              "${maturity[@]}"
-          fi
+
+          gh release create "$TAG" "$dmg" "/tmp/$name.sha256" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "DeepSeek Harness Desktop · macOS x64 · ${{ steps.verify.outputs.version }}" \
+            --notes-file /tmp/release-notes.md \
+            "${maturity[@]}"
 
       - name: Summarize the run
         if: always()
@@ -370,14 +320,15 @@ jobs:
           {
             echo "## macOS 26 Intel (x64) desktop build"
             echo
-            echo "- Trigger: \`${{ github.event_name }}\`"
-            echo "- Runner: \`macos-26-intel\`"
-            echo "- Upstream: \`$UPSTREAM_REPOSITORY@$SOURCE_REF\` = \`${{ steps.revision.outputs.commit }}\`"
-            echo "- Commit check: new commit, built (marker \`built-upstream-${{ needs.check.outputs.commit }}\`)"
-            echo "- Artifact: \`${{ steps.verify.outputs.name }}\`"
-            echo "- Build version: \`${{ steps.verify.outputs.version }}\`"
-            echo "- Architectures: \`${{ steps.verify.outputs.architectures }}\`"
-            echo "- SHA-256: \`${{ steps.verify.outputs.sha256 }}\`"
-            echo "- Signing: ad-hoc signed, not notarized"
-            echo "- Free disk at the end: $((available_kb / 1024 / 1024)) GiB"
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Trigger | \`${{ github.event_name }}\` |"
+            echo "| Runner | \`macos-26-intel\` |"
+            echo "| Upstream | \`$UPSTREAM@${{ needs.check.outputs.commit }}\` |"
+            echo "| Artifact | \`${{ steps.verify.outputs.name }}\` |"
+            echo "| Build version | \`${{ steps.verify.outputs.version }}\` |"
+            echo "| Architectures | \`${{ steps.verify.outputs.architectures }}\` |"
+            echo "| SHA-256 | \`${{ steps.verify.outputs.sha256 }}\` |"
+            echo "| Signing | ad-hoc signed, not notarized |"
+            echo "| Free disk at the end | $((available_kb / 1024 / 1024)) GiB |"
           } >> "$GITHUB_STEP_SUMMARY"

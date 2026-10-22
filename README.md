@@ -5,44 +5,45 @@
 
 本仓库只保存 workflow。源码在运行时从上游远程仓库拉取，不做任何镜像或改动。
 
+## 逻辑
+
+每天 22:00（UTC+8）跑一个 Linux 检查任务，只有上游有新 commit 时才编译。
+
+判断不需要额外记账：**Release 的 tag 就是记录**。
+
+```
+desktop-macos-x64-<上游 commit 前 12 位>
+```
+
+- 该 tag 的 Release 存在 → 这个 commit 已经构建并发布过 → 跳过
+- 不存在 → 构建，成功后用这个 tag 发布 Release
+
+所以"已构建"和"产物在哪"是同一件事，不会出现状态与实际产物不一致。
+**删除某个 Release 就等于要求重建那个 commit。**
+
 ## 使用
 
-**自动执行**：每天北京时间 22:00（UTC+8）检查一次上游 `master`。
+**自动执行**：每天北京时间 22:00。上游没变只跑约 20 秒的检查；有新 commit
+才完整编译（约 40 分钟），产出 DMG + Release。
 
-只有上游有新 commit 时才真正编译；上游没变就只跑一个约 20 秒的 Linux 检查
-job，macOS 构建 job 直接跳过，不会产出重复安装包。
+GitHub 的 cron 用 UTC，`0 14 * * *` 即 UTC+8 的 22:00。定时任务为尽力调度，
+队列繁忙时会延后；且只在默认分支（`main`）生效。仓库连续 60 天无提交活动时
+GitHub 会自动暂停定时任务。
 
-判断依据是仓库里的 `built-upstream-<完整 commit SHA>` tag：构建成功后写一个，
-下次检查发现该 tag 已存在就跳过。用 tag 而不是 Release 记录，是因为 tag 比
-Release 更耐久——删掉 Release 不会让状态丢失。想强制重建同一个 commit，
-手动执行时把 `force` 打开。
+**手动执行**：Actions → **Build Desktop · macOS 26 Intel (x64)** → Run workflow。
 
-GitHub 的 cron 用 UTC，所以 `0 14 * * *` 就是 UTC+8 的 22:00。
-定时任务由 GitHub 尽力调度，队列繁忙时可能延后开始；定时触发只在默认分支
-（`main`）生效。另外仓库连续 60 天没有任何提交活动时，GitHub 会自动暂停
-定时任务，届时改动一下仓库或在 Actions 页面重新启用即可。
+| 参数 | 说明 |
+| --- | --- |
+| `source_ref` | 上游分支或标签，默认 `master` |
+| `build_version` | `auto` 按日期编号（默认）；`product` 用上游清单版本；或显式版本 |
 
-**手动执行**：
-
-1. 打开 **Actions → Build Desktop · macOS 26 Intel (x64) → Run workflow**。
-2. 填写参数：
-
-   | 参数 | 说明 |
-   | --- | --- |
-   | `source_ref` | 上游分支或标签，例如 `master`、`dsh-v0.2.1-alpha.4` |
-   | `build_version` | `auto` 按日期自动编号；`product` 用上游清单版本；也可显式填写受支持的版本 |
-   | `publish_release` | 构建成功后创建 GitHub Release，附 DMG 与 SHA-256 |
-   | `force` | 该上游 commit 已构建过也强制重建 |
-
-   定时任务固定创建 Release；手动执行时由 `publish_release` 决定。
-3. 产物在 run 的 **Artifacts** 里（`deepseek-harness-<版本>-mac-x64-unsigned.dmg`），
-   创建了 Release 时同时出现在 **Releases**。
+产物在 run 的 **Artifacts** 里，同时发布为 **Releases**。
 
 ## 构建内容
 
-流程分两个 job：`check`（ubuntu，约 20 秒）解析上游 ref 到具体 commit 并判断
-是否需要构建；`build`（`macos-26-intel`）只在需要时运行，并检出 `check`
-解析出的那个 commit，避免检查与构建之间分支移动导致构建了没检查过的代码。
+两个 job：`check`（ubuntu，约 20 秒）把上游 ref 解析成具体 commit 并查 Release；
+`build`（`macos-26-intel`）只在需要时运行，检出的正是 `check` 解析出的那个
+commit——检查与构建之间即使分支又推进，也不会构建没检查过的代码。
 
 - Runner：`macos-26-intel`（标准托管 runner，Intel x64，macOS 26）。
 - 命令：上游自带的 `pnpm run package:desktop:mac:x64:unsigned`，即上游的
